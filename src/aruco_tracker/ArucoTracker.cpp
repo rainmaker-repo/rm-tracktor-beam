@@ -6,14 +6,12 @@ ArucoTrackerNode::ArucoTrackerNode()
 {
 	loadParameters();
 
-	// TODO: params to adjust detector params
-	// See: https://docs.opencv.org/4.x/d1/dcd/structcv_1_1aruco_1_1DetectorParameters.html
-	auto detectorParams = cv::aruco::DetectorParameters();
+	// Create detectors for both marker types
+	auto outer_dictionary = cv::aruco::getPredefinedDictionary(_param_outer_dictionary);
+	auto inner_dictionary = cv::aruco::getPredefinedDictionary(_param_inner_dictionary);
 
-	// See: https://docs.opencv.org/4.x/d1/d21/aruco__dictionary_8hpp.html
-	auto dictionary = cv::aruco::getPredefinedDictionary(_param_dictionary);
-
-	_detector = std::make_unique<cv::aruco::ArucoDetector>(dictionary, detectorParams);
+	_outer_detector = std::make_unique<cv::aruco::ArucoDetector>(outer_dictionary, cv::aruco::DetectorParameters());
+	_inner_detector = std::make_unique<cv::aruco::ArucoDetector>(inner_dictionary, cv::aruco::DetectorParameters());
 
 	auto qos = rclcpp::QoS(1).best_effort();
 
@@ -30,13 +28,26 @@ ArucoTrackerNode::ArucoTrackerNode()
 
 void ArucoTrackerNode::loadParameters()
 {
-	declare_parameter<int>("aruco_id", 0);
-	declare_parameter<int>("dictionary", 2); // DICT_4X4_250
-	declare_parameter<double>("marker_size", 0.5);
+	// Outer marker parameters (7x7)
+	declare_parameter<int>("outer_aruco_id", 442);
+	declare_parameter<int>("outer_dictionary", 15); // DICT_7X7_1000
+	declare_parameter<double>("outer_marker_size", 0.3048);
 
-	get_parameter("aruco_id", _param_aruco_id);
-	get_parameter("dictionary", _param_dictionary);
-	get_parameter("marker_size", _param_marker_size);
+	// Inner marker parameters (7x7)
+	declare_parameter<int>("inner_aruco_id", 11);  // Blackest ArUco ID for better detection
+	declare_parameter<int>("inner_dictionary", 15); // DICT_7X7_1000
+	declare_parameter<double>("inner_marker_size", 0.0339);
+
+	// Detection priority
+	declare_parameter<bool>("prefer_inner_marker", true);
+
+	get_parameter("outer_aruco_id", _param_outer_aruco_id);
+	get_parameter("outer_dictionary", _param_outer_dictionary);
+	get_parameter("outer_marker_size", _param_outer_marker_size);
+	get_parameter("inner_aruco_id", _param_inner_aruco_id);
+	get_parameter("inner_dictionary", _param_inner_dictionary);
+	get_parameter("inner_marker_size", _param_inner_marker_size);
+	get_parameter("prefer_inner_marker", _param_prefer_inner_marker);
 }
 
 void ArucoTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
@@ -45,66 +56,111 @@ void ArucoTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr m
 		// Convert ROS image message to OpenCV image
 		cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
 
-		// Detect markers
-		std::vector<int> ids;
-		std::vector<std::vector<cv::Point2f>> corners;
-		_detector->detectMarkers(cv_ptr->image, corners, ids);
-		cv::aruco::drawDetectedMarkers(cv_ptr->image, corners, ids);
+		// Detect markers with both detectors
+		std::vector<int> outer_ids, inner_ids;
+		std::vector<std::vector<cv::Point2f>> outer_corners, inner_corners;
+		
+		_outer_detector->detectMarkers(cv_ptr->image, outer_corners, outer_ids);
+		_inner_detector->detectMarkers(cv_ptr->image, inner_corners, inner_ids);
+
+		// Debug: Log detected markers
+		if (!outer_ids.empty()) {
+			RCLCPP_INFO(get_logger(), "Detected outer markers: %s", 
+				[&outer_ids]() { std::string s; for (int id : outer_ids) s += std::to_string(id) + " "; return s; }().c_str());
+		}
+		if (!inner_ids.empty()) {
+			RCLCPP_INFO(get_logger(), "Detected inner markers: %s", 
+				[&inner_ids]() { std::string s; for (int id : inner_ids) s += std::to_string(id) + " "; return s; }().c_str());
+		}
+
+		// Draw all detected markers
+		cv::aruco::drawDetectedMarkers(cv_ptr->image, outer_corners, outer_ids);
+		cv::aruco::drawDetectedMarkers(cv_ptr->image, inner_corners, inner_ids);
 
 		if (!_camera_matrix.empty() && !_dist_coeffs.empty()) {
 
-			std::vector<std::vector<cv::Point2f>> undistortedCorners;
+			// Process inner markers first if preferred
+			if (_param_prefer_inner_marker) {
+				for (size_t i = 0; i < inner_ids.size(); i++) {
+					if (inner_ids[i] == _param_inner_aruco_id) {
+						// Process inner marker
+						std::vector<cv::Point2f> undistorted_corners;
+						cv::undistortPoints(inner_corners[i], undistorted_corners, _camera_matrix, cv::noArray(), cv::noArray(), _camera_matrix);
 
-			for (const auto& corner : corners) {
-				std::vector<cv::Point2f> undistortedCorner;
-				cv::undistortPoints(corner, undistortedCorner, _camera_matrix, _dist_coeffs, cv::noArray(), _camera_matrix);
-				undistortedCorners.push_back(undistortedCorner);
+						float half_size = _param_inner_marker_size / 2.0f;
+						std::vector<cv::Point3f> objectPoints = {
+							cv::Point3f(-half_size,  half_size, 0),
+							cv::Point3f(half_size,  half_size, 0),
+							cv::Point3f(half_size, -half_size, 0),
+							cv::Point3f(-half_size, -half_size, 0)
+						};
+
+						cv::Vec3d rvec, tvec;
+						cv::solvePnP(objectPoints, undistorted_corners, _camera_matrix, cv::noArray(), rvec, tvec);
+						cv::drawFrameAxes(cv_ptr->image, _camera_matrix, cv::noArray(), rvec, tvec, _param_inner_marker_size);
+
+						// Publish pose
+						cv::Mat rot_mat;
+						cv::Rodrigues(rvec, rot_mat);
+						cv::Quatd quat = cv::Quatd::createFromRotMat(rot_mat).normalize();
+
+						geometry_msgs::msg::PoseStamped pose_msg;
+						pose_msg.header.stamp = msg->header.stamp;
+						pose_msg.header.frame_id = "camera_frame";
+						pose_msg.pose.position.x = tvec[0];
+						pose_msg.pose.position.y = tvec[1];
+						pose_msg.pose.position.z = tvec[2];
+						pose_msg.pose.orientation.x = quat.x;
+						pose_msg.pose.orientation.y = quat.y;
+						pose_msg.pose.orientation.z = quat.z;
+						pose_msg.pose.orientation.w = quat.w;
+
+						_target_pose_pub->publish(pose_msg);
+						annotate_image(cv_ptr, tvec);
+						return; // Exit after processing inner marker
+					}
+				}
 			}
 
-			for (size_t i = 0; i < ids.size(); i++) {
-				if (ids[i] != _param_aruco_id) {
-					continue;
+			// Process outer markers if no inner marker found or not preferred
+			for (size_t i = 0; i < outer_ids.size(); i++) {
+				if (outer_ids[i] == _param_outer_aruco_id) {
+					// Process outer marker
+					std::vector<cv::Point2f> undistorted_corners;
+					cv::undistortPoints(outer_corners[i], undistorted_corners, _camera_matrix, cv::noArray(), cv::noArray(), _camera_matrix);
+
+					float half_size = _param_outer_marker_size / 2.0f;
+					std::vector<cv::Point3f> objectPoints = {
+						cv::Point3f(-half_size,  half_size, 0),
+						cv::Point3f(half_size,  half_size, 0),
+						cv::Point3f(half_size, -half_size, 0),
+						cv::Point3f(-half_size, -half_size, 0)
+					};
+
+					cv::Vec3d rvec, tvec;
+					cv::solvePnP(objectPoints, undistorted_corners, _camera_matrix, cv::noArray(), rvec, tvec);
+					cv::drawFrameAxes(cv_ptr->image, _camera_matrix, cv::noArray(), rvec, tvec, _param_outer_marker_size);
+
+					// Publish pose
+					cv::Mat rot_mat;
+					cv::Rodrigues(rvec, rot_mat);
+					cv::Quatd quat = cv::Quatd::createFromRotMat(rot_mat).normalize();
+
+					geometry_msgs::msg::PoseStamped pose_msg;
+					pose_msg.header.stamp = msg->header.stamp;
+					pose_msg.header.frame_id = "camera_frame";
+					pose_msg.pose.position.x = tvec[0];
+					pose_msg.pose.position.y = tvec[1];
+					pose_msg.pose.position.z = tvec[2];
+					pose_msg.pose.orientation.x = quat.x;
+					pose_msg.pose.orientation.y = quat.y;
+					pose_msg.pose.orientation.z = quat.z;
+					pose_msg.pose.orientation.w = quat.w;
+
+					_target_pose_pub->publish(pose_msg);
+					annotate_image(cv_ptr, tvec);
+					break;
 				}
-
-				// Calculate marker size from camera intrinsics
-				float half_size = _param_marker_size / 2.0f;
-				std::vector<cv::Point3f> objectPoints = {
-					cv::Point3f(-half_size,  half_size, 0),  // top left
-					cv::Point3f(half_size,  half_size, 0),   // top right
-					cv::Point3f(half_size, -half_size, 0),   // bottom right
-					cv::Point3f(-half_size, -half_size, 0)   // bottom left
-				};
-
-				// Use PnP solver to estimate pose
-				cv::Vec3d rvec, tvec;
-				cv::solvePnP(objectPoints, undistortedCorners[i], _camera_matrix, cv::noArray(), rvec, tvec);
-				// Annotate the image
-				cv::drawFrameAxes(cv_ptr->image, _camera_matrix, cv::noArray(), rvec, tvec, _param_marker_size);
-
-				// Quaternion from rotation matrix
-				cv::Mat rot_mat;
-				cv::Rodrigues(rvec, rot_mat);
-				cv::Quatd quat = cv::Quatd::createFromRotMat(rot_mat).normalize();
-
-				// Publish target pose
-				geometry_msgs::msg::PoseStamped pose_msg;
-				pose_msg.header.stamp = msg->header.stamp;
-				pose_msg.header.frame_id = "camera_frame";
-				pose_msg.pose.position.x = tvec[0];
-				pose_msg.pose.position.y = tvec[1];
-				pose_msg.pose.position.z = tvec[2];
-				pose_msg.pose.orientation.x = quat.x;
-				pose_msg.pose.orientation.y = quat.y;
-				pose_msg.pose.orientation.z = quat.z;
-				pose_msg.pose.orientation.w = quat.w;
-
-				_target_pose_pub->publish(pose_msg);
-
-				// Annotate the image
-				annotate_image(cv_ptr, tvec);
-
-				// NOTE: we break here, meaning we only publish the pose of the first target we see
-				break;
 			}
 
 		} else {

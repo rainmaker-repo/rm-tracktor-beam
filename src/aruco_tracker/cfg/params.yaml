@@ -1,5 +1,14 @@
 aruco_tracker:
   ros__parameters:
-    aruco_id: 0
-    dictionary: 2
-    marker_size: 0.5
+    # Outer marker (7x7) - for long-range detection
+    outer_aruco_id: 412
+    outer_dictionary: 3  # DICT_7X7_250
+    outer_marker_size: 0.3048  # 1ft in meters
+    
+    # Inner marker (7x7) - for high-precision close-up detection
+    inner_aruco_id: 11  # Blackest ArUco ID for better detection
+    inner_dictionary: 3  # DICT_7X7_250 (same as outer)
+    inner_marker_size: 0.041  # Size of one square in 7x7 grid (0.3048/7.4)
+    
+    # Detection priority: prefer inner marker for precision
+    prefer_inner_marker: true

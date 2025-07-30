@@ -26,12 +26,23 @@ private:
 	rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr _image_pub;
 	rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr _target_pose_pub;
 
-	std::unique_ptr<cv::aruco::ArucoDetector> _detector;
+	// Multiple detectors for different marker types
+	std::unique_ptr<cv::aruco::ArucoDetector> _outer_detector;  // 7x7 detector
+	std::unique_ptr<cv::aruco::ArucoDetector> _inner_detector;  // 4x4 detector
 	cv::Mat _camera_matrix;
 	cv::Mat _dist_coeffs;
 
-	int _param_aruco_id {};
-	int _param_dictionary {};
-	double _param_marker_size {};
+	// Parameters for outer marker (7x7)
+	int _param_outer_aruco_id {};
+	int _param_outer_dictionary {};
+	double _param_outer_marker_size {};
+
+	// Parameters for inner marker (4x4)
+	int _param_inner_aruco_id {};
+	int _param_inner_dictionary {};
+	double _param_inner_marker_size {};
+
+	// Detection priority
+	bool _param_prefer_inner_marker {};
 };
 
