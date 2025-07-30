@@ -6,4 +6,4 @@
 	url = https://github.com/Auterion/px4-ros2-interface-lib.git
 [submodule "src/px4_msgs"]
 	path = src/px4_msgs
-	url = https://github.com/PX4/px4_msgs.git
+	url = https://github.com/rainmaker-repo/rm-px4_msgs.git
